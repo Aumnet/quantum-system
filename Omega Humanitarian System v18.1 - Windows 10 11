@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Omega Humanitarian System v18.1 - Windows 10/11 Compatible Edition
+
+### КОНФИГУРАЦИЯ СИСТЕМЫ #####################################################
+declare -r VERSION="18.1-WIN"
+declare -r INSTALL_DIR="${PROGRAMFILES:-/Program Files}/OmegaSystem"
+declare -r DATA_DIR="${LOCALAPPDATA:-$HOME/AppData/Local}/OmegaSystem"
+declare -r CONFIG_FILE="$INSTALL_DIR/config.ini"
+declare -r LOG_FILE="$DATA_DIR/logs/system.log"
+declare -r DB_FILE="$DATA_DIR/database/problems.db"
+declare -r LOCK_FILE="$DATA_DIR/system.lock"
+
+### WINDOS-СПЕЦИФИЧНЫЕ НАСТРОЙКИ #############################################
+WIN_DEPS=(
+    "https://git-scm.com/download/win"             # Git Bash
+    "https://sqlite.org/download.html"             # SQLite
+    "https://curl.se/windows/"                     # cURL
+    "https://stedolan.github.io/jq/download/"      # jq
+    "https://www.python.org/downloads/windows/"    # Python 3
+)
+
+### ОСНОВНЫЕ ФУНКЦИИ ДЛЯ WINDOWS ##############################################
+
+# Функция проверки и установки зависимостей
+install_dependencies() {
+    log "INSTALL" "Проверка зависимостей для Windows..."
+    
+    # Проверка Chocolatey (пакетный менеджер для Windows)
+    if ! command -v choco >/dev/null 2>&1; then
+        log "INSTALL" "Установка Chocolatey..."
+        powershell -Command "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
+    fi
+
+    # Установка основных компонентов через Chocolatey
+    choco install -y git sqlite curl jq python3 --no-progress
+    
+    # Проверка WSL для Linux-совместимых компонентов
+    if ! wsl -l >/dev/null 2>&1; then
+        log "INSTALL" "Активация WSL..."
+        wsl --install
+        wsl --set-default-version 2
+    fi
+
+    # Установка Python модулей
+    python -m pip install --upgrade pip
+    pip install requests pandas sqlalchemy reportlab pywin32
+}
+
+# Функция для работы с Windows-сервисом
+register_service() {
+    local service_name="OmegaHumanitarian"
+    
+    if ! sc query "$service_name" >/dev/null 2>&1; then
+        log "SERVICE" "Регистрация системного сервиса..."
+        
+        # Создание bat-файла для запуска
+        cat > "$INSTALL_DIR/start_service.bat" <<EOF
+@echo off
+SET PYTHONIOENCODING=UTF-8
+bash -c "cd /omega_system && ./omega_system.sh --daemon"
+EOF
+
+        # Создание сервиса через NSSM
+        if ! command -v nssm >/dev/null 2>&1; then
+            choco install -y nssm --no-progress
+        fi
+        
+        nssm install "$service_name" "$INSTALL_DIR/start_service.bat"
+        nssm set "$service_name" AppDirectory "$INSTALL_DIR"
+        nssm set "$service_name" DisplayName "Omega Humanitarian System"
+        nssm set "$service_name" Start SERVICE_AUTO_START
+        net start "$service_name"
+    fi
+}
+
+### АДАПТИРОВАННЫЕ МОДУЛИ ДЛЯ WINDOWS #########################################
+
+# Модуль мониторинга (адаптированный для Windows)
+monitor_hunger() {
+    log "HUNGER" "Запуск мониторинга на Windows..."
+    
+    # Использование PowerShell для работы с API
+    local response=$(powershell -Command "
+        \$ProgressPreference = 'SilentlyContinue';
+        Invoke-RestMethod -Uri '${FAO_API}/foodsecurity/country/Yemen' -UseBasicParsing | ConvertTo-Json -Depth 5
+    ")
+    
+    # Обработка через jq
+    local rate=$(echo "$response" | jq -r '.undernourishment')
+    
+    # Windows-совместимый расчет
+    local affected=$(powershell -Command "[math]::Round($(get_population "Yemen") * $rate / 100)")
+    
+    [[ $affected -gt 0 ]] && log "HUNGER" "Обнаружено $affected нуждающихся в Йемене"
+}
+
+# Альтернатива cron для Windows
+setup_scheduler() {
+    log "SCHEDULER" "Настройка планировщика задач Windows..."
+    
+    powershell -Command "
+        \$action = New-ScheduledTaskAction -Execute 'bash.exe' -Argument '-c \"cd /omega_system && ./omega_system.sh\"'
+        \$trigger = New-ScheduledTaskTrigger -Daily -At 9am
+        \$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
+        Register-ScheduledTask -TaskName 'OmegaHumanitarian' -Action \$action -Trigger \$trigger -Settings \$settings -RunLevel Highest -Force
+    "
+}
+
+### ГЛАВНЫЙ ЦИКЛ (WINDOWS-АДАПТИРОВАННЫЙ) ####################################
+
+main() {
+    # Инициализация среды Windows
+    if [[ "$(uname -s)" == *"MINGW"* ]]; then
+        export MSYS=winsymlinks:nativestrict
+        export HOME="$USERPROFILE"
+    fi
+
+    # Проверка и блокировка
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "ERROR" "Система уже запущена"
+        exit 1
+    fi
+
+    # Инициализация
+    init_system
+    register_service
+    
+    # Основной цикл
+    while true; do
+        monitor_hunger
+        monitor_conflicts
+        monitor_health
+        
+        sleep 3600  # Каждый час
+    done
+}
+
+### ИНСТАЛЛЯЦИОННЫЙ ПАКЕТ ####################################################
+
+create_installer() {
+    log "INSTALL" "Создание установщика для Windows..."
+    
+    # Создание NSIS-скрипта
+    cat > "$INSTALL_DIR/installer.nsi" <<EOF
+!include "MUI2.nsh"
+
+Name "Omega Humanitarian System"
+OutFile "OmegaSystem-Installer.exe"
+InstallDir "\$PROGRAMFILES\OmegaSystem"
+
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "Russian"
+
+Section "Main"
+    SetOutPath \$INSTDIR
+    File /r "${INSTALL_DIR}/*"
+    
+    # Создание ярлыка
+    CreateShortCut "\$DESKTOP\OmegaSystem.lnk" "\$INSTDIR\omega_system.sh" "" "\$INSTDIR\icon.ico"
+    
+    # Добавление в PATH
+    EnVar::AddValue "PATH" "\$INSTDIR"
+    
+    # Запуск установки зависимостей
+    ExecWait "bash -c './omega_system.sh --install-deps'"
+    
+    # Регистрация сервиса
+    ExecWait "bash -c './omega_system.sh --register-service'"
+SectionEnd
+EOF
+
+    # Компиляция установщика
+    makensis "$INSTALL_DIR/installer.nsi"
+}
+
+### WINDOS-СПЕЦИФИЧНЫЕ КОМАНДЫ ###############################################
+
+case "$1" in
+    "--install")
+        install_dependencies
+        create_installer
+        ;;
+    "--register-service")
+        register_service
+        ;;
+    "--daemon")
+        main
+        ;;
+    *)
+        echo "Использование: omega_system.sh [--install|--register-service|--daemon]"
+        exit 1
+        ;;
+esac
+
+exit 0
